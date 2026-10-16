@@ -31,6 +31,8 @@ use screenpipe_events::{send_event, PermissionEvent, PermissionKind};
 use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
+#[cfg(target_os = "macos")]
+use crate::recording::UserStopMonitor;
 use crate::server_core::ServerCore;
 
 /// Handle for a running capture session.
@@ -42,16 +44,28 @@ use crate::server_core::ServerCore;
 /// callers don't need to reach into `ServerCore` to stop capture.
 pub struct CaptureSession {
     shutdown_tx: broadcast::Sender<()>,
+    #[cfg(target_os = "macos")]
+    pub(crate) user_stop_id: u64,
+    #[cfg(target_os = "macos")]
+    user_stop_monitor: Option<UserStopMonitor>,
     disk_pressure_data_dir: PathBuf,
     vision_task: Option<tokio::task::JoinHandle<()>>,
     schedule_task: Option<tokio::task::JoinHandle<()>>,
     ui_recorder_handle: Option<screenpipe_engine::UiRecorderHandle>,
     audio_manager: Arc<screenpipe_audio::audio_manager::AudioManager>,
+    audio_start_task: Option<tokio::task::JoinHandle<()>>,
     audio_disabled: bool,
     /// Cleared on stop so `/vision/device/*` stops pointing at a shut-down manager.
     vision_manager_handle: Option<
         Arc<arc_swap::ArcSwap<Option<Arc<screenpipe_engine::vision_manager::VisionManager>>>>,
     >,
+}
+
+pub(crate) async fn cancel_pending_audio_start(task: Option<tokio::task::JoinHandle<()>>) {
+    if let Some(task) = task {
+        task.abort();
+        let _ = task.await;
+    }
 }
 
 impl CaptureSession {
@@ -71,6 +85,12 @@ impl CaptureSession {
         close_orphaned_meetings_on_start: bool,
     ) -> Result<Self, String> {
         info!("Starting capture session");
+
+        // Register before any capture pipeline can create a ScreenCaptureKit stream.
+        #[cfg(target_os = "macos")]
+        let user_stop_monitor = UserStopMonitor::new();
+        #[cfg(target_os = "macos")]
+        let user_stop_id = user_stop_monitor.session_id();
 
         let (shutdown_tx, _) = broadcast::channel::<()>(1);
         reconfigure_audio_manager(server, config).await?;
@@ -227,10 +247,11 @@ impl CaptureSession {
         }
 
         // --- Audio recording ---
+        let mut audio_start_task = None;
         if !config.disable_audio {
             let audio_manager_clone = server.audio_manager.clone();
             let drm_pause = config.pause_on_drm_content;
-            tokio::spawn(async move {
+            audio_start_task = Some(tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 if let Err(e) = audio_manager_clone.start().await {
                     error!("Failed to start audio manager: {}", e);
@@ -240,7 +261,7 @@ impl CaptureSession {
                         warn!("failed to stop SCK audio after late DRM detection: {:?}", e);
                     }
                 }
-            });
+            }));
         }
 
         // --- UI event recording ---
@@ -331,11 +352,16 @@ impl CaptureSession {
 
         Ok(Self {
             shutdown_tx,
+            #[cfg(target_os = "macos")]
+            user_stop_id,
+            #[cfg(target_os = "macos")]
+            user_stop_monitor: Some(user_stop_monitor),
             disk_pressure_data_dir: server.data_path.clone(),
             vision_task,
             schedule_task,
             ui_recorder_handle,
             audio_manager: server.audio_manager.clone(),
+            audio_start_task,
             audio_disabled: config.disable_audio,
             vision_manager_handle,
         })
@@ -351,6 +377,13 @@ impl CaptureSession {
             self.disk_pressure_data_dir.clone(),
             self.shutdown_tx.subscribe(),
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn start_native_user_stop_monitor(&mut self, app: &tauri::AppHandle) {
+        if let Some(monitor) = self.user_stop_monitor.take() {
+            monitor.activate(app.clone(), self.shutdown_tx.subscribe());
+        }
     }
 
     /// Stop all capture pipelines. The server stays alive.
@@ -377,6 +410,10 @@ impl CaptureSession {
 
         // Broadcast shutdown to VisionManager, meeting watcher, schedule monitor, compaction
         let _ = self.shutdown_tx.send(());
+
+        // A pending starter must finish cancellation before the final stop,
+        // otherwise its one-second delay can resurrect audio after user pause.
+        cancel_pending_audio_start(self.audio_start_task.take()).await;
 
         // Join before allowing a replacement session to initialize the shared
         // schedule flag; an old monitor must never re-pause the new session.

@@ -301,6 +301,10 @@ const CAPTURE_RESTART_MEETING_REATTACH_WINDOW: Duration = Duration::from_secs(12
 
 mod db_wedge;
 pub(crate) mod recovery_log;
+#[cfg(any(target_os = "macos", test))]
+mod native_user_stop;
+#[cfg(target_os = "macos")]
+pub(crate) use native_user_stop::UserStopMonitor;
 mod retry;
 mod server_shutdown;
 pub use db_wedge::{
@@ -375,11 +379,18 @@ pub struct RecordingState {
 
 /// Install a fully constructed capture session before activating any monitor
 /// that can synchronously request its teardown.
-pub(crate) fn install_capture_session(slot: &mut Option<CaptureSession>, session: CaptureSession) {
+pub(crate) fn install_capture_session(
+    slot: &mut Option<CaptureSession>,
+    session: CaptureSession,
+    _app: &tauri::AppHandle,
+) {
     *slot = Some(session);
-    slot.as_ref()
-        .expect("capture session was just installed")
-        .start_disk_pressure_monitor();
+    let session = slot
+        .as_mut()
+        .expect("capture session was just installed");
+    session.start_disk_pressure_monitor();
+    #[cfg(target_os = "macos")]
+    session.start_native_user_stop_monitor(_app);
 }
 
 impl RecordingState {
@@ -885,7 +896,7 @@ async fn start_capture_inner(
     let session = CaptureSession::start(server, &config, false).await?;
     drop(server_guard);
 
-    install_capture_session(&mut capture_guard, session);
+    install_capture_session(&mut capture_guard, session, &app);
 
     info!("Capture session started");
     Ok(())
@@ -1649,6 +1660,7 @@ async fn spawn_screenpipe_after_migration(
     // the dedicated server thread so the freshly-built `ServerCore` gets the hook
     // before it starts writing.
     let app_for_db_wedge = app.clone();
+    let app_for_native_user_stop = app.clone();
     let db_wedge_breaker = state.db_wedge_breaker.clone();
 
     // Pipe output callback. Stage 5: legacy `pipe_event` topic dropped.
@@ -1791,7 +1803,11 @@ async fn spawn_screenpipe_after_migration(
                     *guard = Some(server);
                 }
                 if let Some(capture) = capture {
-                    install_capture_session(&mut capture_guard, capture);
+                    install_capture_session(
+                        &mut capture_guard,
+                        capture,
+                        &app_for_native_user_stop,
+                    );
                     info!("Server + capture started successfully on dedicated runtime");
                 } else {
                     info!("Server started with capture deliberately stopped");
@@ -1901,7 +1917,7 @@ pub(crate) async fn start_capture_internal(
     let session = CaptureSession::start(server, &config, false).await?;
     drop(server_guard);
 
-    install_capture_session(&mut capture_guard, session);
+    install_capture_session(&mut capture_guard, session, app);
     state.is_starting.store(false, Ordering::SeqCst);
 
     info!("Capture started on existing server");

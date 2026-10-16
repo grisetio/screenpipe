@@ -37,6 +37,8 @@ pub mod monitor;
 pub mod wgc_capture;
 #[cfg(target_os = "macos")]
 pub use monitor::HdCapture;
+#[cfg(target_os = "macos")]
+pub use sck_rs::{subscribe_user_stop, UserStopSubscription};
 pub use monitor::MonitorListError;
 pub mod metrics;
 pub mod ocr_cache;

@@ -2226,6 +2226,7 @@ async fn main() {
                                 crate::recording::install_capture_session(
                                     &mut capture_guard,
                                     capture,
+                                    &app_for_owned,
                                 );
                                 info!("Server + capture started successfully on dedicated runtime");
                             } else {
